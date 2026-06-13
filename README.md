@@ -1,52 +1,106 @@
-# Geohash Encoder
+# geohash-encoder: Geohash Encoding and Decoding
 
-**A Rust library for encoding and decoding geographic coordinates using the Geohash system** — a hierarchical spatial index that represents lat/lon pairs as compact base32 strings.
+A zero-dependency implementation of the **Geohash** geocoding system (Gustavo Niemeyer, 2008). Encodes (latitude, longitude) pairs into base-32 strings and decodes them back, with neighbor computation for spatial adjacency queries.
 
 ## Why It Matters
 
-Geohash is the spatial indexing standard used by Redis, Elasticsearch, MongoDB, and countless geolocation services. By interleaving the bits of latitude and longitude, geohashes produce strings where **shared prefixes indicate geographic proximity** — the hash `u4pruyd` is inside `u4pr`, which is inside `u4`. This prefix property enables efficient bounding-box queries: `WHERE geohash LIKE 'u4pr%'` finds all points in a ~5 km × 5 km region using a simple B-tree index. The 8-character hash achieves ±19 m precision, sufficient for most consumer mapping applications.
+Geohashing is the standard technique for encoding continuous geographic coordinates into a discrete, prefix-comparable string. Because geohashes form a **Z-order curve** (Morton code) over the Earth's surface, they enable:
+
+- **Database indexing**: Nearby points share string prefixes, making B-tree range queries efficient
+- **Spatial proximity**: "Find all points within geohash `u4pr`" is a simple string prefix scan
+- ** Adjustable precision**: A 1-character hash covers ~5000 km; a 12-character hash covers ~3.7 cm
+- **Distributed systems**: Geohash ranges partition cleanly across shards
+
+Used by Redis, MongoDB, Elasticsearch, Google's S2 geometry, and every ride-sharing/delivery app.
 
 ## How It Works
 
-**Encoding** alternates between longitude and latitude bits, performing a binary search on each range. For each of the 5 bits in a base32 character: if the coordinate is in the upper half of the current range, emit 1 and narrow to the upper half; otherwise emit 0 and narrow to the lower half. Longitude is encoded first (even bit positions), then latitude (odd positions). Every 5 bits produce one base32 character from the alphabet `0123456789bcdefghjkmnpqrstuvwxyz` (note: `a`, `i`, `l`, `o` are excluded to avoid confusion with digits).
+### Encoding Algorithm
 
-**Decoding** reverses this: each base32 character yields 5 bits, which are used to narrow the lat/lon ranges. The result is the center point of the decoded cell, with precision determined by the hash length.
+The encoder interleaves bits for longitude and latitude, performing a **binary search** on the bounding box:
 
-**Neighbor computation** decodes the center point, offsets by one cell width in each of 8 directions (N, NE, E, SE, S, SW, W, NW), and re-encodes. The cell dimensions shrink as `180°/4^(5p/2)` for latitude and `360°/4^((5p+1)/2)` for longitude, where `p` is the precision (hash length).
+```
+For each bit position (up to precision × 5):
+    if even bit: bisect longitude range
+    if odd bit:  bisect latitude range
+    if coordinate ≥ midpoint: append 1, narrow lower bound
+    else:                    append 0, narrow upper bound
+After 5 bits: emit next base-32 character
+```
+
+The bit interleaving (longitude first) ensures that geohashes with common prefixes are geographically close — this is the key property of the Z-order curve.
+
+### Base-32 Alphabet
+
+Geohash uses a custom base-32 alphabet that excludes `a`, `i`, `l`, and `o` to avoid confusion:
+
+```
+0123456789bcdefghjkmnpqrstuvwxyz
+```
+
+### Decoding
+
+Reverse process: each base-32 character yields 5 bits, de-interleaved into lon/lat bit sequences that narrow the bounding box. The decoded coordinate is the **center** of the final bounding box.
+
+### Precision vs. Cell Size
+
+| Precision | Cell Width | Cell Height | Example Coverage |
+|-----------|-----------|-------------|-----------------|
+| 1 | 5000 km | 5000 km | Continent |
+| 4 | 39 km | 20 km | City |
+| 7 | 153 m | 76 m | City block |
+| 9 | 4.8 m | 4.8 m | Indoor |
+| 12 | 3.7 cm | 1.9 cm | Point |
+
+### Neighbor Computation
+
+Given a geohash, computes its 8 surrounding cells by decoding to (lat, lon), offsetting by the cell dimensions, and re-encoding. This enables ring queries: get all neighbors at the same precision level.
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `encode(lat, lon, p)` | O(p) | O(p) |
+| `decode(hash)` | O(p) | O(1) |
+| `neighbors(hash)` | O(p) | O(1) |
+
+Where p = precision (number of characters).
 
 ## Quick Start
 
 ```rust
 use geohash_encoder::{encode, decode, neighbors};
 
-fn main() {
-    // Encode: latitude first, then longitude, with precision
-    let hash = encode(57.64911, 10.40744, 12);
-    println!("Geohash: {}", hash); // u4pruydqqvj8
+// Encode Copenhagen: 57.64911°N, 10.40744°E
+let hash = encode(57.64911, 10.40744, 12);
+assert_eq!(&hash[..4], "u4pr");
 
-    // Decode back to coordinates
-    let (lat, lon) = decode(&hash).unwrap();
-    println!("Decoded: ({:.5}, {:.5})", lat, lon);
+// Decode back (center of cell)
+let (lat, lon) = decode(&hash).unwrap();
+assert!((lat - 57.64911).abs() < 0.001);
 
-    // Get 8 neighbors (for ring queries)
-    let nbs = neighbors(&hash).unwrap();
-    for (i, n) in nbs.iter().enumerate() {
-        println!("Neighbor {}: {}", i, n);
-    }
-}
+// Get 8 neighbors
+let n = neighbors(&hash).unwrap();
+assert_eq!(n.len(), 8);
 ```
 
 ## API
 
-| Function | Complexity | Description |
-|---|---|---|
-| `encode(lat, lon, precision)` | **O(p)** | Encode coordinates to a geohash string |
-| `decode(hash)` | **O(p)** | Decode a geohash to `(lat, lon)` center point |
-| `neighbors(hash)` | **O(p)** | Compute 8 adjacent geohashes (ring-1) |
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `encode` | `(lat: f64, lon: f64, precision: usize) -> String` | Encode coordinates to geohash |
+| `decode` | `(hash: &str) -> Option<(f64, f64)>` | Decode to (lat, lon) center |
+| `neighbors` | `(hash: &str) -> Option<Vec<String>>` | 8 adjacent cells at same precision |
 
 ## Architecture Notes
 
-Part of the SuperInstance geospatial toolkit. Used alongside `h3-index` (hexagonal indexing) for fleet vehicle tracking and proximity queries. See the [Architecture Guide](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+This is a **γ (gamma)** module — pure functions, no state, no I/O. In the γ + η = C framework, it provides the spatial encoding primitive. An **η** layer would build spatial indexes (geohash tree, prefix trie), proximity search, and clustering on top of these primitives. The Z-order curve is not a perfect space-filling curve (it has discontinuities at power-of-2 boundaries), but it is the most widely deployed one.
+
+## References
+
+- Niemeyer, G. (2008). *Geohash: A Degree of Precision*. geohash.org.
+- Morton, G. M. (1966). *A Computer Oriented Geodetic Data Base*. IBM.
+- Sahr, K., White, D., & Kimerling, A. J. (2003). *Geodesic Discrete Global Grid Systems*. Cartography and Geographic Information Science 30(2).
 
 ## License
 
